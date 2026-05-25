@@ -1672,23 +1672,6 @@ pgsm_create_hash_entry(int64 queryid, const PlanInfo *plan_info)
 	entry->key.toplevel = (nesting_level + plan_nested_level == 0);
 #endif
 
-	if (IsTransactionState())
-	{
-		char	   *datname = get_database_name(entry->key.dbid);
-		char	   *username = GetUserNameFromId(entry->key.userid, true);
-
-		if (datname)
-		{
-			strlcpy(entry->datname, datname, sizeof(entry->datname));
-			pfree(datname);
-		}
-		if (username)
-		{
-			strlcpy(entry->username, username, sizeof(entry->username));
-			pfree(username);
-		}
-	}
-
 	MemoryContextSwitchTo(oldctx);
 
 	return entry;
@@ -1736,6 +1719,27 @@ pgsm_store(pgsmEntry *entry)
 
 	/* Let's do all the leg work here before we acquire any locks */
 	extract_query_comments(query, comments, sizeof(comments));
+
+	if (IsTransactionState() && strlen(entry->datname) == 0)
+	{
+		char	   *datname = get_database_name(entry->key.dbid);
+
+		if (datname)
+		{
+			strlcpy(entry->datname, datname, sizeof(entry->datname));
+			pfree(datname);
+		}
+	}
+	if (IsTransactionState() && strlen(entry->username) == 0)
+	{
+		char	   *username = GetUserNameFromId(entry->key.userid, true);
+
+		if (username)
+		{
+			snprintf(entry->username, sizeof(entry->username), "%s", username);
+			pfree(username);			
+		}
+	}
 
 	/* bufusage */
 	bufusage.shared_blks_hit = entry->counters.blocks.shared_blks_hit;
