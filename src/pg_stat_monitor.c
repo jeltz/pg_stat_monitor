@@ -1265,6 +1265,9 @@ pgsm_update_entry(pgsmEntry *entry,
 	int			index;
 	int			plan_text_len = plan_info ? plan_info->plan_len : 0;
 
+	if (kind == PGSM_STORE)
+		SpinLockAcquire(&entry->mutex);
+
 	/*
 	 * Start collecting data for next bucket and reset all counters and
 	 * timestamps
@@ -1275,9 +1278,6 @@ pgsm_update_entry(pgsmEntry *entry,
 		entry->stats_since = GetCurrentTimestamp();
 		entry->minmax_stats_since = entry->stats_since;
 	}
-
-	if (kind == PGSM_STORE)
-		SpinLockAcquire(&entry->mutex);
 
 	/*
 	 * Extract comments if enabled and only when the query has completed with
