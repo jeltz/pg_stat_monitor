@@ -111,15 +111,8 @@ static int	plan_nested_level = 0;
 #define pgsm_query_instr(qd)	((qd)->totaltime)
 #endif
 
-/* Histogram bucket variables */
-static double hist_bucket_min;
-static double hist_bucket_max;
-static struct
-{
-	double		start;
-	double		end;
-}			hist_bucket_timings[MAX_RESPONSE_BUCKET + 2];
-static int	hist_bucket_count_user;
+/* Upper bounds of histogram buckets, last one INFINITY */
+static double hist_bucket_timings[MAX_RESPONSE_BUCKET + 2];
 static int	hist_bucket_count_total;
 
 /* The array to store outer layer query id */
@@ -143,7 +136,6 @@ static char *pgsm_explain(QueryDesc *queryDesc);
 static void pgsm_shmem_startup(void);
 static void extract_query_comments(const char *query, char *comments, size_t max_len);
 static void set_histogram_bucket_timings(void);
-static double histogram_bucket_boundary(int index);
 static int	get_histogram_bucket(double q_time);
 
 static bool IsSystemInitialized(void);
@@ -3115,86 +3107,37 @@ time_diff(struct timeval end, struct timeval start)
 static void
 set_histogram_bucket_timings(void)
 {
-	hist_bucket_min = pgsm_histogram_min;
-	hist_bucket_max = pgsm_histogram_max;
-	hist_bucket_count_user = pgsm_histogram_buckets;
-
-	if (hist_bucket_count_user >= 2)
-	{
-		int			b_count = hist_bucket_count_user;
-
-		for (; hist_bucket_count_user > 0; hist_bucket_count_user--)
-		{
-			/* TODO: This is likely broken as it ignores pgsm_histogram_min */
-			double		b2_start = histogram_bucket_boundary(2);
-			double		b2_end = histogram_bucket_boundary(3);
-
-			/*
-			 * The first bucket size will always be one or greater as we're
-			 * doing min value + e^0; and e^0 = 1. Checking if histograms
-			 * buckets overlap. That can only happen if the second bucket size
-			 * is zero as we using exponential bucket sizes. Therefore, if the
-			 * second bucket size is greater than 1, we'll never have
-			 * overlapping buckets.
-			 */
-			if (b2_start != b2_end)
-			{
-				break;
-			}
-		}
-
-		if (b_count != hist_bucket_count_user)
-			ereport(WARNING,
-					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("pg_stat_monitor: Histogram buckets are overlapping."),
-					errdetail("Histogram bucket size is set to %d [not including outlier buckets].", hist_bucket_count_user));
-	}
-
-	/*
-	 * Important that we keep user bucket count separate for calculations, but
-	 * must add 1 for max outlier queries. However, for min, bucket should
-	 * only be added if the minimum value provided by user is greater than 0
-	 */
-	hist_bucket_count_total = hist_bucket_count_user + (int) (hist_bucket_max < HISTOGRAM_MAX_TIME) + (int) (hist_bucket_min > 0);
-
-	for (int index = 0; index < hist_bucket_count_total; index++)
-	{
-		hist_bucket_timings[index].start = histogram_bucket_boundary(index);
-		hist_bucket_timings[index].end = histogram_bucket_boundary(index + 1);
-	}
-}
-
-/*
- * Given an index, return the lower histogram bucket boundary
- */
-static double
-histogram_bucket_boundary(int index)
-{
-	double		q_min = hist_bucket_min;
-	double		q_max = hist_bucket_max;
-	int			b_count = hist_bucket_count_total;
-	int			b_count_user = hist_bucket_count_user;
 	double		bucket_size;
-
-	/*
-	 * Can't do exp(0) as that returns 1. So handling the case of first entry
-	 * specifically
-	 */
-	if (index == 0)
-		return 0;
-	if (index == b_count)
-		return INFINITY;
-	if (q_min > 0 && index == 1)
-		return q_min;
+	int			total = 0;
 
 	/*
 	 * Equisized logarithmic values will yield exponential values as required.
-	 * For calculating logarithmic value, we MUST use the number of bucket
-	 * provided by the user.
 	 */
-	bucket_size = log(q_max - q_min) / (double) b_count_user;
+	bucket_size = log(pgsm_histogram_max - pgsm_histogram_min) / (double) pgsm_histogram_buckets;
 
-	return q_min + exp(bucket_size * (index - 1 + (q_min == 0)));
+	if (pgsm_histogram_min > 0)
+		hist_bucket_timings[total++] = pgsm_histogram_min;
+
+	if (exp(bucket_size) == 0)
+	{
+		/* TODO: Inherited from old code. Can this even happen? */
+		ereport(WARNING,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("pg_stat_monitor: Histogram buckets are overlapping."));
+	}
+	else
+	{
+		for (int i = 1; i < pgsm_histogram_buckets; i++)
+			hist_bucket_timings[total++] = pgsm_histogram_min + exp(bucket_size * i);
+	}
+
+	if (pgsm_histogram_max < HISTOGRAM_MAX_TIME)
+		hist_bucket_timings[total++] = pgsm_histogram_max;
+
+	/* Make sure everything ends up in a bucket */
+	hist_bucket_timings[total++] = INFINITY;
+
+	hist_bucket_count_total = total;
 }
 
 /*
@@ -3205,7 +3148,7 @@ get_histogram_bucket(double q_time)
 {
 	for (int index = 0; index < hist_bucket_count_total - 1; index++)
 	{
-		if (q_time <= hist_bucket_timings[index].end)
+		if (q_time <= hist_bucket_timings[index])
 			return index;
 	}
 
@@ -3227,17 +3170,20 @@ get_histogram_timings(PG_FUNCTION_ARGS)
 
 	for (int index = 0; index < hist_bucket_count_total; index++)
 	{
+		double		b_start = index > 0 ? hist_bucket_timings[index - 1] : 0;
+		double		b_end = hist_bucket_timings[index];
+
 		if (index == 0)
 			appendStringInfoChar(&buf, '{');
 		else
 			appendStringInfoString(&buf, ", (");
 
-		appendStringInfo(&buf, "%.3f - ", hist_bucket_timings[index].start);
+		appendStringInfo(&buf, "%.3f - ", b_start);
 
-		if (hist_bucket_timings[index].end == INFINITY)
+		if (b_end == INFINITY)
 			appendStringInfoString(&buf, "...");
 		else
-			appendStringInfo(&buf, "%.3f", hist_bucket_timings[index].end);
+			appendStringInfo(&buf, "%.3f", b_end);
 
 		appendStringInfoChar(&buf, '}');
 	}
