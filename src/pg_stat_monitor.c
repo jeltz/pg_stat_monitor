@@ -1211,24 +1211,15 @@ pg_get_application_name(char *name, int buff_size)
 static uint
 pg_get_client_addr(void)
 {
-	char		remote_host[NI_MAXHOST];
-	int			ret;
-
 	if (!MyProcPort)
 		return ntohl(inet_addr("127.0.0.1"));
 
-	ret = pg_getnameinfo_all(&MyProcPort->raddr.addr,
-							 MyProcPort->raddr.salen,
-							 remote_host, sizeof(remote_host),
-							 NULL, 0,
-							 NI_NUMERICHOST | NI_NUMERICSERV);
-	if (ret != 0)
+	if (MyProcPort->raddr.addr.ss_family == AF_INET)
+		return ntohl(((struct sockaddr_in *) &MyProcPort->raddr.addr)->sin_addr.s_addr);
+	else if (MyProcPort->raddr.addr.ss_family == AF_UNIX)
 		return ntohl(inet_addr("127.0.0.1"));
-
-	if (strcmp(remote_host, "[local]") == 0)
-		return ntohl(inet_addr("127.0.0.1"));
-
-	return ntohl(inet_addr(remote_host));
+	else
+		return -1;
 }
 
 static void
